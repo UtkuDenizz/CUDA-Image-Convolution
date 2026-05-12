@@ -42,3 +42,4 @@ The data loading process from Global Memory to Shared Memory is designed to be *
 ### Compilation:
 ```bash
 nvcc -o convolution convolution_filter.cu
+convolution
