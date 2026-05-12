@@ -1,46 +1,69 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include <time.h> // for cpu time measurement
 
 #define KERNEL_SIZE 3
 #define WIDTH 1024
 #define HEIGHT 1024
 #define TILE_SIZE 16
 
-//  constant memory hızlı erişim
-__constant__ float c_kernel[KERNEL_SIZE * KERNEL_SIZE];
+__constant__ float c_kernel[9];
 
-// shared memory kullanan optimize kernel
+// kernels - functions
+void convolutionCPU(float *in, float *kernel, float *out, int w, int h) {
+    int r = KERNEL_SIZE / 2;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float sum = 0.0f;
+            for (int ky = -r; ky <= r; ky++) {
+                for (int kx = -r; kx <= r; kx++) {
+                    int iy = y + ky; int ix = x + kx;
+                    if (iy >= 0 && iy < h && ix >= 0 && ix < w)
+                        sum += in[iy * w + ix] * kernel[(ky + r) * KERNEL_SIZE + (kx + r)];
+                }
+            }
+            out[y * w + x] = sum;
+        }
+    }
+}
+
+__global__ void convolutionNaive(float *in, float *kernel, float *out, int w, int h) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < w && y < h) {
+        int r = KERNEL_SIZE / 2;
+        float sum = 0.0f;
+        for (int ky = -r; ky <= r; ky++) {
+            for (int kx = -r; kx <= r; kx++) {
+                int iy = y + ky; int ix = x + kx;
+                if (iy >= 0 && iy < h && ix >= 0 && ix < w)
+                    sum += in[iy * w + ix] * kernel[(ky + r) * KERNEL_SIZE + (kx + r)];
+            }
+        }
+        out[y * w + x] = sum;
+    }
+}
+
 __global__ void convolutionShared(float *in, float *out, int w, int h) {
     __shared__ float tile[TILE_SIZE + KERNEL_SIZE - 1][TILE_SIZE + KERNEL_SIZE - 1];
-
     int r = KERNEL_SIZE / 2;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    
-    int x = blockIdx.x * TILE_SIZE + tx;
-    int y = blockIdx.y * TILE_SIZE + ty;
+    int tx = threadIdx.x; int ty = threadIdx.y;
+    int x = blockIdx.x * TILE_SIZE + tx; int y = blockIdx.y * TILE_SIZE + ty;
 
-    // shared memory ye veri yükleme - coalesced access
     for (int i = ty; i < TILE_SIZE + KERNEL_SIZE - 1; i += TILE_SIZE) {
         for (int j = tx; j < TILE_SIZE + KERNEL_SIZE - 1; j += TILE_SIZE) {
             int iy = blockIdx.y * TILE_SIZE + i - r;
             int ix = blockIdx.x * TILE_SIZE + j - r;
-
-            if (iy >= 0 && iy < h && ix >= 0 && ix < w)
-                tile[i][j] = in[iy * w + ix];
-            else
-                tile[i][j] = 0.0f; 
+            if (iy >= 0 && iy < h && ix >= 0 && ix < w) tile[i][j] = in[iy * w + ix];
+            else tile[i][j] = 0.0f;
         }
     }
-
-    __syncthreads(); // wait for all the pixels
-
+    __syncthreads();
     if (x < w && y < h) {
         float sum = 0.0f;
         for (int ky = 0; ky < KERNEL_SIZE; ky++) {
-            for (int kx = 0; kx < KERNEL_SIZE; kx++) {
+            for (int kx = 0; kx < KERNEL_SIZE; kx++)
                 sum += tile[ty + ky][tx + kx] * c_kernel[ky * KERNEL_SIZE + kx];
-            }
         }
         out[y * w + x] = sum;
     }
@@ -48,38 +71,40 @@ __global__ void convolutionShared(float *in, float *out, int w, int h) {
 
 int main() {
     size_t size = WIDTH * HEIGHT * sizeof(float);
-    float *h_in, *h_out, *h_kernel, *d_in, *d_out;
+    float *h_in = (float*)malloc(size), *h_out = (float*)malloc(size), *h_k = (float*)malloc(9*sizeof(float));
+    float *d_in, *d_out, *d_k_naive;
+    cudaMalloc(&d_in, size); cudaMalloc(&d_out, size); cudaMalloc(&d_k_naive, 9*sizeof(float));
 
-    h_in = (float*)malloc(size);
-    h_out = (float*)malloc(size);
-    h_kernel = (float*)malloc(KERNEL_SIZE * KERNEL_SIZE * sizeof(float));
-
-    cudaMalloc(&d_in, size);
-    cudaMalloc(&d_out, size);
-
-    for(int i=0; i<WIDTH*HEIGHT; i++) h_in[i] = (float)(i % 255);
-    for(int i=0; i<9; i++) h_kernel[i] = 1.0f/9.0f;
+    for(int i=0; i<WIDTH*HEIGHT; i++) h_in[i] = 1.0f;
+    for(int i=0; i<9; i++) h_k[i] = 1.0f/9.0f;
 
     cudaMemcpy(d_in, h_in, size, cudaMemcpyHostToDevice);
-    // copy to constant memory 
-    cudaMemcpyToSymbol(c_kernel, h_kernel, KERNEL_SIZE * KERNEL_SIZE * sizeof(float));
+    cudaMemcpy(d_k_naive, h_k, 9*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(c_kernel, h_k, 9*sizeof(float));
 
-    dim3 threads(TILE_SIZE, TILE_SIZE);
-    dim3 blocks((WIDTH + TILE_SIZE - 1) / TILE_SIZE, (HEIGHT + TILE_SIZE - 1) / TILE_SIZE);
+    // 1. cpu Ölçümü
+    clock_t start_c = clock();
+    convolutionCPU(h_in, h_k, h_out, WIDTH, HEIGHT);
+    clock_t end_c = clock();
+    double cpu_ms = ((double)(end_c - start_c) / CLOCKS_PER_SEC) * 1000;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
+    // naive gpu 
+    cudaEvent_t s1, e1; cudaEventCreate(&s1); cudaEventCreate(&e1);
+    cudaEventRecord(s1);
+    convolutionNaive<<<dim3((WIDTH+15)/16, (HEIGHT+15)/16), dim3(16,16)>>>(d_in, d_k_naive, d_out, WIDTH, HEIGHT);
+    cudaEventRecord(e1); cudaEventSynchronize(e1);
+    float naive_ms; cudaEventElapsedTime(&naive_ms, s1, e1);
 
-    cudaEventRecord(start);
-    convolutionShared<<<blocks, threads>>>(d_in, d_out, WIDTH, HEIGHT);
-    cudaEventRecord(stop);
-    cudaDeviceSynchronize();
+    // optimized gpu 
+    cudaEventRecord(s1);
+    convolutionShared<<<dim3((WIDTH+15)/16, (HEIGHT+15)/16), dim3(16,16)>>>(d_in, d_out, WIDTH, HEIGHT);
+    cudaEventRecord(e1); cudaEventSynchronize(e1);
+    float opt_ms; cudaEventElapsedTime(&opt_ms, s1, e1);
 
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
-    printf("Optimized GPU Time (Shared Memory): %f ms\n", ms);
+    printf("CPU Time: %f ms\n", cpu_ms);
+    printf("Naive GPU Time: %f ms\n", naive_ms);
+    printf("Optimized GPU Time: %f ms\n", opt_ms);
+    printf("Total Speedup: %fx\n", cpu_ms / opt_ms);
 
-    cudaFree(d_in); cudaFree(d_out);
-    free(h_in); free(h_out); free(h_kernel);
     return 0;
 }
