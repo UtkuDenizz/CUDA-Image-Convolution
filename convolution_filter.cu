@@ -82,7 +82,7 @@ int main() {
     cudaMemcpy(d_k_naive, h_k, 9*sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpyToSymbol(c_kernel, h_k, 9*sizeof(float));
 
-    // 1. cpu Ölçümü
+    // 1. cpu measurement
     clock_t start_c = clock();
     convolutionCPU(h_in, h_k, h_out, WIDTH, HEIGHT);
     clock_t end_c = clock();
